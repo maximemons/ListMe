@@ -1190,6 +1190,54 @@ dialog.sheet::backdrop {
   color: var(--muted);
 }
 
+.share-option {
+  margin: 0 0 10px;
+  align-items: flex-start;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.share-option small {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.share-option input {
+  margin-top: 1px;
+  flex: none;
+}
+
+/* QR code : toujours noir sur fond blanc, même en mode sombre, pour être scanné */
+.qr-box {
+  margin: 4px 0 0;
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+}
+
+.qr-img {
+  width: min(260px, 72vw);
+  padding: 10px;
+  border-radius: 16px;
+  background: #fff;
+  border: 1px solid var(--line);
+}
+
+.qr-img svg {
+  width: 100%;
+  height: auto;
+}
+
+.qr-box figcaption {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: center;
+}
+
 /* ---------------------------------------------------------------- Accueil */
 
 .welcome {

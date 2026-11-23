@@ -37,7 +37,7 @@ index.html?items=Lait:2;Pain;Œufs:12;Lessive:1
 - `list=ID` ajoute les articles à cette liste (et l’ouvre). Sans `list`, ils vont dans la liste courante.
 - `name=Apéro` avec des articles et sans `list` crée une nouvelle liste portant ce nom.
 - Les produits inconnus sont classés un par un ; fermer la fenêtre les range dans « Autre ».
-- Paramètres ignorés : `list`, `name`, `fbclid`, `gclid`, `utm_*`.
+- Paramètres ignorés : `list`, `name`, `space`, `store`, `fbclid`, `gclid`, `utm_*`.
 
 La fenêtre de partage génère aussi un « lien d’ajout » contenant les articles restants de la liste.
 
@@ -66,6 +66,19 @@ La fenêtre de partage génère aussi un « lien d’ajout » contenant les arti
 - À l’ouverture d’une liste, si l’appareil autorise la localisation et que le magasin le plus proche n’est pas celui sélectionné, une fenêtre propose de le choisir (une fois par liste et par session). La position de l’appareil n’est jamais envoyée au serveur ; seule celle des magasins est enregistrée.
 - Les magasins (et leurs prix) sont aussi rattachés aux listes que vous ouvrez : les personnes avec qui une liste est partagée voient les mêmes magasins et les mêmes prix.
 
+### Partager un magasin
+
+- Dans « Magasins », l’icône de partage d’un magasin (ou « Partager ce magasin » dans sa fiche) donne un lien `?store=ID`.
+- La personne qui l’ouvre ajoute ce magasin et ses prix à ses propres magasins, sans accéder à vos listes. S’il s’agit de son premier magasin, il devient son favori.
+- C’est le même magasin pour tout le monde : les prix saisis par chacun sont partagés, et le supprimer le supprime chez tous.
+
+### Partager une liste avec son magasin
+
+- Dans la fenêtre de partage d’une liste, si un magasin est sélectionné, la case « Inclure le magasin » (cochée par défaut) ajoute ce magasin au lien : `?list=ID&store=ID`.
+- Dans la fenêtre de partage d’un magasin, la case « Partager aussi la liste » produit le même lien.
+- La personne qui l’ouvre rejoint la liste, reçoit le magasin et ses prix, et ce magasin est sélectionné pour cette liste (son propre favori ne change pas).
+- Le lien et le QR code se mettent à jour quand on coche ou décoche l’option. Le code de liste seul ne transmet pas le magasin.
+
 ## Mes appareils
 
 - « Mes listes » > « Retrouver sur un autre appareil » donne un lien personnel. L’ouvrir sur un autre téléphone ou ordinateur y synchronise toutes vos listes, vos magasins, leurs prix et votre magasin favori, dans les deux sens.
@@ -77,7 +90,8 @@ La fenêtre de partage génère aussi un « lien d’ajout » contenant les arti
 
 - Le nom de la liste, en haut, ouvre « Mes listes » : changer de liste, en créer, renommer, retirer.
 - Les listes sont gardées sur l’appareil (localStorage) et synchronisées avec vos autres appareils (voir « Mes appareils »).
-- Le bouton de partage fournit le lien de la liste. Toute personne qui l’ouvre voit et modifie la même liste, en direct.
+- Le bouton de partage fournit le lien de la liste, son code et un QR code à scanner. Toute personne qui l’ouvre voit et modifie la même liste, en direct.
+- Les liens de partage d’un magasin et de « Mes appareils » proposent aussi un QR code.
 
 ## Hors ligne
 
@@ -98,6 +112,7 @@ ListMe/
 │   ├── store.js            # stockage local et file d'attente
 │   ├── sync.js             # synchronisation Firestore
 │   ├── products-data.js    # rayons et catalogue de base
+│   ├── vendor/qrcode.js    # génération des QR codes (qrcode-generator, licence MIT)
 │   └── firebase-config.js  # configuration Firebase
 ├── sw.js                   # service worker (hors ligne)
 ├── manifest.webmanifest    # installation sur l'écran d'accueil

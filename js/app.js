@@ -1,6 +1,7 @@
 import { store } from './store.js';
 import * as sync from './sync.js';
 import { AISLES, PRODUCTS } from './products-data.js';
+import qrcode from './vendor/qrcode.js';
 
 /* =========================================================================
    Constantes & icônes
@@ -8,7 +9,7 @@ import { AISLES, PRODUCTS } from './products-data.js';
 
 const AISLE = Object.fromEntries(AISLES.map((a, i) => [a.id, { ...a, order: i }]));
 const aisleOf = (id) => AISLE[id] || AISLE.autre;
-const RESERVED_PARAMS = new Set(['list', 'name', 'items', 'add', 'space', 'fbclid', 'gclid']);
+const RESERVED_PARAMS = new Set(['list', 'name', 'items', 'add', 'space', 'store', 'fbclid', 'gclid']);
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const svg = (d, extra = '') =>
@@ -27,6 +28,7 @@ const ICON = {
   starFill: svg('<path d="M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.8l-5.2 2.8 1-5.8-4.3-4.1 5.9-.8z" fill="currentColor"/>'),
   pin: svg('<path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0113 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/>'),
   locate: svg('<circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/><circle cx="12" cy="12" r="7"/>'),
+  qr: svg('<rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1"/><path d="M14 14h2.5v2.5H14zM18 18h2.5v2.5H18zM14 18.5v2M18.5 14h2"/>'),
   link: svg('<path d="M10 14a4 4 0 005.66 0l3-3a4 4 0 00-5.66-5.66l-1 1M14 10a4 4 0 00-5.66 0l-3 3a4 4 0 005.66 5.66l1-1"/>'),
 };
 
@@ -220,6 +222,7 @@ const state = {
   storeId: null, // magasin sélectionné pour l'estimation
   position: null, // dernière position connue de l'appareil (jamais envoyée au serveur)
   metaStoreIds: null, // magasins rattachés à la liste côté serveur (null = inconnu)
+  incomingStoreId: null, // magasin reçu par un lien de partage, en cours de chargement
 };
 const storeWatchers = new Map();
 
@@ -473,6 +476,10 @@ function onRemoteStore(id, data) {
   if (store.hasPending(['stores', id])) return;
   const all = storesMap();
   if (!data || typeof data.name !== 'string') {
+    if (id === state.incomingStoreId) {
+      state.incomingStoreId = null;
+      toast('Ce magasin n’existe plus : il a été supprimé par la personne qui l’a partagé.');
+    }
     if (!all[id]) return;
     delete all[id];
     store.saveStores(all);
@@ -495,7 +502,96 @@ function onRemoteStore(id, data) {
   };
   store.saveStores(all);
   if (wasLoading && !state.storeId && store.getFavStore() === id) state.storeId = id;
+  if (id === state.incomingStoreId) welcomeIncomingStore(all[id]);
   render();
+}
+
+/* ---- Partage d'un magasin seul : lien « ?store=ID » ---- */
+
+function storeShareUrl(id) {
+  return `${baseUrl()}?store=${id}`;
+}
+
+/** Ajoute un magasin reçu par lien (sans donner accès aux listes de la personne qui l'a partagé). */
+function adoptStore(id, { select = false } = {}) {
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(id)) return;
+  store.removeDeadStore(id);
+  const all = storesMap();
+  if (all[id] && !all[id].loading) {
+    if (select && state.listId) {
+      selectStore(id);
+      toast(`Prix de « ${all[id].name} » affichés pour cette liste`);
+    } else {
+      toast(`« ${all[id].name} » fait déjà partie de vos magasins`);
+    }
+    return;
+  }
+  state.incomingSelect = select;
+  if (!all[id]) {
+    all[id] = { id, loading: true };
+    store.saveStores(all);
+  }
+  state.incomingStoreId = id;
+  if (!navigator.onLine) toast('Magasin reçu. Il s’affichera dès le retour du réseau.');
+  pushSpace();
+  syncStoreWatchers();
+}
+
+function welcomeIncomingStore(s) {
+  state.incomingStoreId = null;
+  let msg = `Magasin « ${s.name} » ajouté`;
+  if (!store.getFavStore()) {
+    setFavorite(s.id);
+    msg += ' et choisi comme favori';
+  }
+  // Lien « liste + magasin » : le magasin partagé est sélectionné pour la liste, même si un autre l'était.
+  if (state.listId && (!state.storeId || state.incomingSelect)) {
+    state.storeId = s.id;
+    sessionSet(`listme:store:${state.listId}`, s.id);
+  }
+  state.incomingSelect = false;
+  toast(msg);
+}
+
+function openStoreShare(id) {
+  const s = getStore(id);
+  if (!s) return;
+  const list = getList();
+  let withList = false;
+  const urlFor = () => (withList && list ? `${baseUrl()}?list=${list.id}&store=${s.id}` : storeShareUrl(s.id));
+  const captionFor = () => (withList && list ? `Scannez pour ajouter « ${s.name} » et ouvrir « ${list.name} »` : `Scannez pour ajouter « ${s.name} »`);
+  const nPrices = Object.values(s.prices || {}).filter((v) => v != null).length;
+  const prices = nPrices ? ` et ${plural(nPrices, 'prix enregistré', 'prix enregistrés')}` : '';
+  const textFor = () =>
+    withList && list
+      ? `La personne qui ouvre ce lien ajoute ce magasin${prices} à ses magasins et rejoint la liste « ${list.name} », qu’elle pourra modifier en direct avec vous. Le magasin y sera sélectionné.`
+      : `La personne qui ouvre ce lien ajoute ce magasin${prices} à ses propres magasins, sans accéder à vos listes. Les prix saisis ensuite, chez vous comme chez elle, sont partagés.`;
+  const url = urlFor();
+  openSheet({
+    title: `Partager « ${s.name} »`,
+    body: `<p class="sheet-text" data-share-text>${esc(textFor())}</p>
+      ${list ? `<label class="toggle share-option"><input type="checkbox" data-include>
+        <span>Partager aussi la liste « ${esc(list.name)} »</span></label>` : ''}
+      <div class="copy-field"><input class="text" readonly data-link value="${esc(url)}" aria-label="Lien de partage du magasin">
+        <button class="icon-btn" data-copy-link data-copy="${esc(url)}" aria-label="Copier le lien">${ICON.copy}</button></div>
+      <div class="stack">
+        ${navigator.share ? `<button class="btn btn-primary" data-native>${ICON.share} Envoyer le lien</button>` : `<button class="btn btn-primary" data-copy-link data-copy="${esc(url)}">${ICON.copy} Copier le lien</button>`}
+        ${qrSection(url, captionFor())}
+      </div>
+      <p class="sheet-note">C’est le même magasin pour tout le monde : s’il est supprimé, il disparaît aussi chez les personnes avec qui il est partagé.</p>`,
+    onMount: ({ el }) => {
+      el.querySelector('[data-include]')?.addEventListener('change', (e) => {
+        withList = e.target.checked;
+        el.querySelector('[data-share-text]').textContent = textFor();
+        refreshShareLink(el, urlFor(), captionFor());
+      });
+      shareSheetClicks(el, () => ({
+        title: `ListMe : magasin ${s.name}`,
+        text: withList && list ? `Le magasin « ${s.name} » et la liste « ${list.name} » sur ListMe` : `Le magasin « ${s.name} » et ses prix sur ListMe`,
+        url: urlFor(),
+      }));
+    },
+  });
 }
 
 /* ---- Prix ---- */
@@ -828,6 +924,7 @@ function openDevices() {
         <button class="icon-btn" data-copy="${esc(url)}" aria-label="Copier le lien">${ICON.copy}</button></div>
       <div class="stack">
         ${navigator.share ? `<button class="btn btn-primary" data-native>${ICON.share} Envoyer le lien</button>` : `<button class="btn btn-primary" data-copy="${esc(url)}">${ICON.copy} Copier le lien</button>`}
+        ${qrSection(url, 'Scannez avec votre autre appareil')}
       </div>
       <p class="sheet-note">Ce lien donne accès à toutes vos listes et vos magasins : gardez-le pour vous et votre foyer. Pour partager une seule liste, utilisez le bouton de partage de la liste.</p>
       <details class="more">
@@ -848,6 +945,7 @@ function openDevices() {
           } catch { /* partage annulé */ }
         }
       });
+      bindQr(el);
       el.querySelector('[data-join]').addEventListener('submit', (e) => {
         e.preventDefault();
         const raw = e.target.elements.link.value.trim();
@@ -1178,7 +1276,7 @@ function readUrlParams() {
       entries.push({ name: k.trim(), qty: parseQty(v) });
     }
   }
-  return { listId: params.get('list'), name: params.get('name'), space: params.get('space'), entries };
+  return { listId: params.get('list'), name: params.get('name'), space: params.get('space'), storeId: params.get('store'), entries };
 }
 
 async function importEntries(entries) {
@@ -1594,14 +1692,101 @@ function baseUrl() {
   return `${location.origin}${location.pathname}`;
 }
 
+/* ---- QR code ---- */
+
+/** QR code en SVG (noir sur blanc, zone de silence de 4 modules) pour un scan fiable. */
+function qrSvg(text) {
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  const n = qr.getModuleCount();
+  const q = 4;
+  let d = '';
+  for (let y = 0; y < n; y++) {
+    let x = 0;
+    while (x < n) {
+      if (!qr.isDark(y, x)) { x++; continue; }
+      const start = x;
+      while (x < n && qr.isDark(y, x)) x++;
+      d += `M${start + q} ${y + q}h${x - start}v1h-${x - start}z`;
+    }
+  }
+  const size = n + q * 2;
+  return `<svg viewBox="0 0 ${size} ${size}" role="img" aria-label="QR code" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg"><rect width="${size}" height="${size}" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+}
+
+/** Bouton « QR code » + zone d'affichage, générée à la demande. */
+function qrSection(url, caption) {
+  return `<button class="btn btn-secondary" type="button" data-qr-toggle aria-expanded="false">${ICON.qr} <span>Afficher le QR code</span></button>
+    <figure class="qr-box" data-qr-box data-qr-url="${esc(url)}" hidden>
+      <div class="qr-img"></div>
+      <figcaption>${esc(caption)}</figcaption>
+    </figure>`;
+}
+
+function bindQr(el) {
+  const btn = el.querySelector('[data-qr-toggle]');
+  const box = el.querySelector('[data-qr-box]');
+  if (!btn || !box) return;
+  btn.addEventListener('click', () => {
+    const open = box.hidden;
+    if (open && !box.querySelector('svg')) {
+      try {
+        box.querySelector('.qr-img').innerHTML = qrSvg(box.dataset.qrUrl);
+      } catch {
+        box.querySelector('.qr-img').textContent = 'QR code impossible à générer pour ce lien.';
+      }
+    }
+    box.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+    btn.querySelector('span').textContent = open ? 'Masquer le QR code' : 'Afficher le QR code';
+    if (open) box.scrollIntoView({ block: 'nearest', behavior: reducedMotion ? 'auto' : 'smooth' });
+  });
+}
+
+/** Met à jour un lien affiché (champ, boutons copier, QR code) quand une option change. */
+function refreshShareLink(el, url, caption) {
+  const input = el.querySelector('[data-link]');
+  if (input) input.value = url;
+  el.querySelectorAll('[data-copy-link]').forEach((b) => (b.dataset.copy = url));
+  const box = el.querySelector('[data-qr-box]');
+  if (box) {
+    box.dataset.qrUrl = url;
+    if (caption) box.querySelector('figcaption').textContent = caption;
+    const img = box.querySelector('.qr-img');
+    if (img.querySelector('svg')) img.innerHTML = qrSvg(url);
+  }
+}
+
+function shareSheetClicks(el, getShareData) {
+  el.addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('[data-copy]');
+    if (copyBtn) {
+      const what = copyBtn.dataset.copy.startsWith('http') ? 'Lien copié' : 'Code copié';
+      toast((await copyText(copyBtn.dataset.copy)) ? what : 'Copie impossible, sélectionnez le texte');
+    }
+    if (e.target.closest('[data-native]')) {
+      try {
+        await navigator.share(getShareData());
+      } catch { /* partage annulé */ }
+    }
+  });
+  bindQr(el);
+  el.querySelectorAll('input[readonly]').forEach((i) => i.addEventListener('focus', () => i.select()));
+}
+
 function openShare() {
   const list = getList();
   if (!list) return;
-  const shareUrl = `${baseUrl()}?list=${list.id}`;
+  const s = currentStore();
+  let withStore = !!s;
+  const urlFor = () => `${baseUrl()}?list=${list.id}${withStore && s ? `&store=${s.id}` : ''}`;
+  const captionFor = () => (withStore && s ? `Scannez pour ouvrir « ${list.name} » avec ${s.name}` : `Scannez pour ouvrir « ${list.name} »`);
   const todo = Object.values(state.items).filter((i) => !i.checked);
   const importUrl = todo.length
     ? `${baseUrl()}?items=${encodeURIComponent(todo.map((i) => (i.qty === 1 ? i.name : `${i.name}:${i.qty}`)).join(';'))}`
     : '';
+  const url = urlFor();
   openSheet({
     title: 'Partager la liste',
     body: `<p class="sheet-text">Toute personne qui ouvre ce lien, ou saisit le code de la liste à l’accueil de ListMe, la voit et la modifie en direct avec vous.</p>
@@ -1610,10 +1795,13 @@ function openShare() {
         <strong>${esc(fmtCode(list.id))}</strong>
         <button class="icon-btn" data-copy="${esc(list.id)}" aria-label="Copier le code">${ICON.copy}</button>
       </div>
-      <div class="copy-field"><input class="text" readonly value="${esc(shareUrl)}" aria-label="Lien de partage">
-        <button class="icon-btn" data-copy="${esc(shareUrl)}" aria-label="Copier le lien">${ICON.copy}</button></div>
+      ${s ? `<label class="toggle share-option"><input type="checkbox" data-include checked>
+        <span>Inclure le magasin « ${esc(s.name)} » et ses prix<small>Il sera sélectionné pour cette liste chez la personne.</small></span></label>` : ''}
+      <div class="copy-field"><input class="text" readonly data-link value="${esc(url)}" aria-label="Lien de partage">
+        <button class="icon-btn" data-copy-link data-copy="${esc(url)}" aria-label="Copier le lien">${ICON.copy}</button></div>
       <div class="stack">
-        ${navigator.share ? `<button class="btn btn-primary" data-native>${ICON.share} Envoyer le lien</button>` : `<button class="btn btn-primary" data-copy="${esc(shareUrl)}">${ICON.copy} Copier le lien</button>`}
+        ${navigator.share ? `<button class="btn btn-primary" data-native>${ICON.share} Envoyer le lien</button>` : `<button class="btn btn-primary" data-copy-link data-copy="${esc(url)}">${ICON.copy} Copier le lien</button>`}
+        ${qrSection(url, captionFor())}
       </div>
       ${importUrl ? `<details class="more">
         <summary>${ICON.link} Lien d’ajout des articles</summary>
@@ -1622,19 +1810,15 @@ function openShare() {
           <button class="icon-btn" data-copy="${esc(importUrl)}" aria-label="Copier le lien d’ajout">${ICON.copy}</button></div>
       </details>` : ''}`,
     onMount: ({ el }) => {
-      el.addEventListener('click', async (e) => {
-        const copyBtn = e.target.closest('[data-copy]');
-        if (copyBtn) {
-          const what = copyBtn.dataset.copy.startsWith('http') ? 'Lien copié' : 'Code copié';
-          toast((await copyText(copyBtn.dataset.copy)) ? what : 'Copie impossible, sélectionnez le texte');
-        }
-        if (e.target.closest('[data-native]')) {
-          try {
-            await navigator.share({ title: `ListMe : ${list.name}`, text: `Ma liste de courses « ${list.name} »`, url: shareUrl });
-          } catch { /* partage annulé */ }
-        }
+      el.querySelector('[data-include]')?.addEventListener('change', (e) => {
+        withStore = e.target.checked;
+        refreshShareLink(el, urlFor(), captionFor());
       });
-      el.querySelectorAll('input[readonly]').forEach((i) => i.addEventListener('focus', () => i.select()));
+      shareSheetClicks(el, () => ({
+        title: `ListMe : ${list.name}`,
+        text: withStore && s ? `Ma liste de courses « ${list.name} », avec les prix de ${s.name}` : `Ma liste de courses « ${list.name} »`,
+        url: urlFor(),
+      }));
     },
   });
 }
@@ -1735,6 +1919,7 @@ function openStores() {
             <small>${dist}, ${plural(nPrices, 'prix', 'prix')}</small>
           </button>
           <button class="icon-btn fav-btn${isFav ? ' is-fav' : ''}" data-fav="${esc(s.id)}" aria-pressed="${isFav}" aria-label="${isFav ? 'Retirer le favori' : `Définir ${esc(s.name)} comme favori`}">${isFav ? ICON.starFill : ICON.star}</button>
+          <button class="icon-btn" data-share-store="${esc(s.id)}" aria-label="Partager ${esc(s.name)}">${ICON.share}</button>
           <button class="icon-btn" data-edit-store="${esc(s.id)}" aria-label="Modifier ${esc(s.name)}">${ICON.edit}</button>
         </li>`;
     })
@@ -1761,6 +1946,9 @@ function openStores() {
           close();
           openStores();
           renderHeader();
+        } else if (b.dataset.shareStore) {
+          close();
+          openStoreShare(b.dataset.shareStore);
         } else if (b.dataset.editStore) {
           close();
           openStoreForm(b.dataset.editStore);
@@ -1795,7 +1983,8 @@ function openStoreForm(id) {
         </div>
         <label class="toggle"><input type="checkbox" name="fav" ${isFav ? 'checked' : ''}> <span>Magasin favori (choisi par défaut)</span></label>
         <button class="btn btn-primary" type="submit">${s ? 'Enregistrer' : 'Ajouter le magasin'}</button>
-        ${s ? `<button class="btn btn-secondary is-danger" type="button" data-delete>${ICON.trash} Supprimer le magasin</button>` : ''}
+        ${s ? `<button class="btn btn-secondary" type="button" data-share>${ICON.share} Partager ce magasin</button>
+        <button class="btn btn-secondary is-danger" type="button" data-delete>${ICON.trash} Supprimer le magasin</button>` : ''}
       </form>`,
     onMount: ({ el, close }) => {
       const form = el.querySelector('[data-form]');
@@ -1814,11 +2003,15 @@ function openStoreForm(id) {
         if (pos) form.coords.value = `${pos.lat.toFixed(6)}, ${pos.lng.toFixed(6)}`;
         else showError('Position indisponible. Autorisez la localisation pour ce site ou saisissez les coordonnées.');
       });
+      el.querySelector('[data-share]')?.addEventListener('click', () => {
+        close();
+        openStoreShare(s.id);
+      });
       el.querySelector('[data-delete]')?.addEventListener('click', async () => {
         close();
         const ok = await confirmSheet(
           'Supprimer ce magasin ?',
-          `« ${s.name} » et ses prix seront supprimés, y compris pour les personnes avec qui vos listes sont partagées.`,
+          `« ${s.name} » et ses prix seront supprimés, y compris pour les personnes avec qui ce magasin ou vos listes sont partagés.`,
           'Supprimer le magasin'
         );
         if (ok) {
@@ -2201,7 +2394,7 @@ async function boot() {
   registerServiceWorker();
   sync.onStatus(renderStatus);
 
-  const { listId, name, space, entries } = readUrlParams();
+  const { listId, name, space, storeId, entries } = readUrlParams();
   let id = null;
   const joined = space ? joinSpace(space) : false;
   if (store.getLists().length || Object.keys(storesMap()).length) spaceId();
@@ -2229,6 +2422,11 @@ async function boot() {
   if (entries.length) await importEntries(entries);
 
   if (joined) toast('Appareil synchronisé. Vos listes et magasins arrivent.');
+  if (storeId) {
+    // Liste + magasin : ne pas proposer un autre magasin « plus proche » à l'ouverture.
+    if (listId) sessionSet(`listme:geoAsked:${listId}`, '1');
+    adoptStore(storeId, { select: !!listId });
+  }
 
   sync.onReady(() => {
     attachWatchers();

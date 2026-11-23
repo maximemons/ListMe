@@ -91,6 +91,9 @@ export const store = {
   getDeadStores() {
     return read(K.deadStores, []);
   },
+  removeDeadStore(id) {
+    write(K.deadStores, this.getDeadStores().filter((x) => x !== id));
+  },
   addDeadStore(id) {
     const dead = this.getDeadStores();
     if (!dead.includes(id)) write(K.deadStores, [...dead, id].slice(-200));

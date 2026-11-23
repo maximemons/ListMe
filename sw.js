@@ -1,6 +1,6 @@
 // Service worker ListMe : rend l'application disponible hors ligne.
 // Incrémenter VERSION à chaque mise en ligne pour rafraîchir le cache.
-const VERSION = 'listme-v1.2.0';
+const VERSION = 'listme-v1.5.0';
 
 const SHELL = [
   './',
@@ -11,6 +11,7 @@ const SHELL = [
   './js/sync.js',
   './js/products-data.js',
   './js/firebase-config.js',
+  './js/vendor/qrcode.js',
   './manifest.webmanifest',
   './favicon.ico',
   './icons/icon-192.png',
