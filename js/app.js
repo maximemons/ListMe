@@ -8,7 +8,7 @@ import { AISLES, PRODUCTS } from './products-data.js';
 
 const AISLE = Object.fromEntries(AISLES.map((a, i) => [a.id, { ...a, order: i }]));
 const aisleOf = (id) => AISLE[id] || AISLE.autre;
-const RESERVED_PARAMS = new Set(['list', 'name', 'items', 'add', 'fbclid', 'gclid']);
+const RESERVED_PARAMS = new Set(['list', 'name', 'items', 'add', 'space', 'fbclid', 'gclid']);
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const svg = (d, extra = '') =>
@@ -86,6 +86,12 @@ const fmtQty = (q) => (typeof q === 'number' ? String(q).replace('.', ',') : Str
 function parseEntry(text) {
   let name = (text || '').trim().replace(/\s+/g, ' ');
   let qty = 1;
+  // Poids ou volume : « 500 g de farine », « 1,5 kg pommes », « lait 1 l »
+  const unit = '(kg|g|mg|l|dl|cl|ml)';
+  let w = name.match(new RegExp(`^(\\d+(?:[.,]\\d+)?)\\s*${unit}\\.?\\s+(?:de |d['’])?(.+)$`, 'i'));
+  if (w) return { name: w[3], qty: `${w[1].replace('.', ',')} ${w[2].toLowerCase()}` };
+  w = name.match(new RegExp(`^(.+?)\\s+(\\d+(?:[.,]\\d+)?)\\s*${unit}\\.?$`, 'i'));
+  if (w) return { name: w[1], qty: `${w[2].replace('.', ',')} ${w[3].toLowerCase()}` };
   let m = name.match(/^(\d+(?:[.,]\d+)?)\s*(?:x|×|\*)?\s+(.+)$/i);
   if (m) {
     qty = parseQty(m[1]);
@@ -176,14 +182,27 @@ function registerProduct(name, aisle, id = slug(name)) {
 }
 
 function mergeRemoteProducts(remote) {
-  const pending = store.pendingProductIds();
+  const pending = store.pendingProductOps();
   const local = store.getProducts();
   const next = {};
   for (const p of remote) {
     if (p && typeof p.name === 'string') next[p.id] = { id: p.id, name: p.name, aisle: p.aisle, updatedAt: p.updatedAt || 0 };
   }
-  for (const id of pending) if (local[id]) next[id] = local[id];
+  for (const [id, op] of pending) {
+    if (op.op === 'delete') delete next[id];
+    else if (local[id]) next[id] = local[id];
+  }
   store.saveProducts(next);
+  buildCatalog();
+}
+
+/** Retire un produit ajouté par un utilisateur (les produits du catalogue de base restent). */
+function removeCustomProduct(id) {
+  const custom = store.getProducts();
+  if (!custom[id]) return;
+  delete custom[id];
+  store.saveProducts(custom);
+  enqueue({ op: 'delete', path: ['products', id] });
   buildCatalog();
 }
 
@@ -212,9 +231,10 @@ function enqueue(op) {
 const getList = (id = state.listId) => store.getLists().find((l) => l.id === id) || null;
 const itemPath = (listId, itemId) => ['lists', listId, 'items', itemId];
 
-function createList(name = 'Ma liste') {
-  const list = { id: uid(20), name: tidy(name) || 'Ma liste', createdAt: Date.now() };
+function createList(name = 'Ma liste', { auto = false } = {}) {
+  const list = { id: uid(20), name: tidy(name) || 'Ma liste', createdAt: Date.now(), ...(auto ? { auto: true } : {}) };
   store.upsertList(list);
+  if (!auto) pushSpace();
   enqueue({
     op: 'set',
     path: ['lists', list.id],
@@ -236,6 +256,7 @@ function enqueueMeta(listId, patch) {
 }
 
 function openList(id, { propose = true } = {}) {
+  hideWelcome();
   if (state.unwatch) state.unwatch();
   state.unwatch = null;
   state.listId = id;
@@ -389,6 +410,7 @@ function saveStore(s) {
 function createStore({ name, lat, lng }) {
   const s = saveStore({ id: uid(20), name, lat, lng, prices: {}, createdAt: Date.now() });
   if (state.metaStoreIds) linkStoresWithList(state.listId, state.metaStoreIds);
+  pushSpace();
   return s;
 }
 
@@ -399,6 +421,7 @@ function deleteStore(id) {
   store.addDeadStore(id);
   enqueue({ op: 'delete', path: ['stores', id] });
   if (store.getFavStore() === id) store.setFavStore(null);
+  pushSpace({ withFav: true });
   if (state.storeId === id) selectStore(null);
   if (state.metaStoreIds?.includes(id)) {
     state.metaStoreIds = state.metaStoreIds.filter((x) => x !== id);
@@ -419,7 +442,10 @@ function linkStoresWithList(listId, remoteIds) {
       changed = true;
     }
   }
-  if (changed) store.saveStores(all);
+  if (changed) {
+    store.saveStores(all);
+    pushSpace();
+  }
   const alive = remoteIds.filter((id) => !dead.has(id));
   const union = [...new Set([...alive, ...Object.keys(all)])].slice(0, 30);
   state.metaStoreIds = union;
@@ -476,37 +502,101 @@ function onRemoteStore(id, data) {
 
 const priceKey = (name) => findProduct(name)?.id || slug(name);
 
-function priceOf(item, s = currentStore()) {
-  const v = s?.prices?.[priceKey(item.name)];
-  return typeof v === 'number' && v >= 0 ? v : null;
+/* ---- Quantités au poids / volume ---- */
+
+const UNIT_BASE = { kg: ['g', 1000], g: ['g', 1], mg: ['g', 0.001], l: ['ml', 1000], dl: ['ml', 100], cl: ['ml', 10], ml: ['ml', 1] };
+const MEASURE_RE = /^(\d+(?:[.,]\d+)?)\s*(kg|g|mg|l|dl|cl|ml)\.?$/i;
+const frNum = (n) => String(Math.round(n * 100) / 100).replace('.', ',');
+
+/** « 60 g », « 1,5 kg », « 250 g + 1 » → { base: 'g'|'ml', value } ou null. */
+function parseMeasure(q) {
+  if (typeof q !== 'string') return null;
+  let base = null;
+  let value = 0;
+  for (const part of q.split('+')) {
+    const m = part.trim().match(MEASURE_RE);
+    if (!m) continue;
+    const [b, f] = UNIT_BASE[m[2].toLowerCase()];
+    if (base && base !== b) continue;
+    base = b;
+    value += parseFloat(m[1].replace(',', '.')) * f;
+  }
+  return base ? { base, value } : null;
 }
 
-const lineTotal = (item, unit) => (typeof item.qty === 'number' ? unit * item.qty : unit);
+function formatMeasure(value, base) {
+  if (base === 'g') return value >= 1000 ? `${frNum(value / 1000)} kg` : `${frNum(Math.ceil(value))} g`;
+  if (value >= 1000) return `${frNum(value / 1000)} l`;
+  if (value >= 10 && value % 10 === 0) return `${frNum(value / 10)} cl`;
+  return `${frNum(value)} ml`;
+}
+
+/** Additionne deux quantités : 2 + 1, « 60 g » + « 200 g ». Sinon la nouvelle remplace l'ancienne. */
+function combineQty(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') return Math.round((a + b) * 100) / 100;
+  const ma = parseMeasure(a);
+  const mb = parseMeasure(b);
+  if (ma && mb && ma.base === mb.base) return formatMeasure(ma.value + mb.value, ma.base);
+  return b;
+}
+
+/* ---- Prix ----
+   Un prix enregistré pour un produit dans un magasin peut être :
+   - un nombre (ancien format) : prix à l'unité ;
+   - { p, m: 'unit' }          : prix à l'unité ;
+   - { p, m: 'pack', a, u }    : prix d'un paquet de a grammes (u = 'g') ou millilitres (u = 'ml') ;
+   - { p, m: 'bulk', a, u }    : prix au poids (vrac), p pour a g ou ml (a = 1000 : prix au kg / au litre). */
+
+function priceEntry(item, s = currentStore()) {
+  const v = s?.prices?.[priceKey(item.name)];
+  if (typeof v === 'number' && v >= 0) return { p: v, m: 'unit' };
+  if (!v || typeof v !== 'object' || typeof v.p !== 'number' || v.p < 0) return null;
+  const m = v.m === 'pack' || v.m === 'bulk' ? v.m : 'unit';
+  const a = Number(v.a) > 0 ? Number(v.a) : 0;
+  if (m !== 'unit' && !a) return { p: v.p, m: 'unit' };
+  return { p: v.p, m, a, u: v.u === 'ml' ? 'ml' : 'g' };
+}
+
+/** Coût d'une ligne : { cost, buy } où buy décrit ce qu'il faut acheter (« 1 × 1 kg »). */
+function lineCost(item, e) {
+  if (!e) return null;
+  const n = typeof item.qty === 'number' ? item.qty : 1;
+  if (e.m === 'unit') return { cost: e.p * n, buy: '' };
+  const need = parseMeasure(item.qty);
+  const fits = need && need.base === e.u;
+  if (e.m === 'pack') {
+    const count = fits ? Math.max(1, Math.ceil(need.value / e.a - 1e-9)) : n;
+    return { cost: e.p * count, buy: `${frNum(count)} × ${formatMeasure(e.a, e.u)}` };
+  }
+  const amount = fits ? need.value : e.a * n;
+  return { cost: (e.p * amount) / e.a, buy: fits ? '' : formatMeasure(amount, e.u) };
+}
+
+const perRef = (e) => `${money((e.p / e.a) * 1000)}/${e.u === 'ml' ? 'l' : 'kg'}`;
 
 function estimate() {
   const res = { total: 0, inCart: 0, missing: 0, priced: 0 };
   if (!currentStore()) return res;
   for (const it of Object.values(state.items)) {
-    const p = priceOf(it);
-    if (p == null) {
+    const c = lineCost(it, priceEntry(it));
+    if (!c) {
       res.missing += 1;
       continue;
     }
-    const t = lineTotal(it, p);
-    res.total += t;
+    res.total += c.cost;
     res.priced += 1;
-    if (it.checked) res.inCart += t;
+    if (it.checked) res.inCart += c.cost;
   }
   res.total = Math.round(res.total * 100) / 100;
   res.inCart = Math.round(res.inCart * 100) / 100;
   return res;
 }
 
-function setPrice(item, value) {
+function setPrice(item, entry) {
   const s = currentStore();
   if (!s) return;
   const prices = { ...(s.prices || {}) };
-  prices[priceKey(item.name)] = value; // null = prix effacé
+  prices[priceKey(item.name)] = entry; // null = prix effacé
   saveStore({ ...s, prices });
   render();
 }
@@ -553,6 +643,7 @@ function getPosition(timeout = 10000) {
 /** À l'ouverture d'une liste : propose le magasin le plus proche s'il diffère du magasin choisi. */
 async function proposeNearestStore() {
   const listId = state.listId;
+  if (!listId) return;
   const located = storeList().filter(hasCoords);
   if (!located.length || !navigator.geolocation) return;
   const askedKey = `listme:geoAsked:${listId}`;
@@ -588,11 +679,378 @@ async function proposeNearestStore() {
 }
 
 /* =========================================================================
+   Espace personnel : retrouver ses listes, magasins et favori sur tous ses appareils
+   Document spaces/{id} : { lists: {idListe: nom|null}, stores: {idMagasin: true|null}, favStore }
+   (null = supprimé). Chaque appareil possède un espace ; ouvrir le lien
+   « ?space=ID » sur un autre appareil le rattache au même espace.
+   ========================================================================= */
+
+const SPACE_RE = /^[A-Za-z0-9_-]{16,64}$/;
+let unwatchSpace = null;
+
+function spaceId() {
+  let id = store.getSpaceId();
+  if (!id) {
+    id = uid(24);
+    store.setSpaceId(id);
+    pushSpace({ withFav: true });
+    queueMicrotask(watchSpace);
+  }
+  return id;
+}
+
+const isAutoEmpty = (l) => l.auto && !Object.keys(l.id === state.listId ? state.items : store.getItems(l.id)).length;
+
+function spaceData({ withFav = false } = {}) {
+  const lists = {};
+  for (const l of store.getLists()) if (!isAutoEmpty(l)) lists[l.id] = l.name;
+  for (const id of store.getDeadLists()) if (!(id in lists)) lists[id] = null;
+  const stores = {};
+  for (const id of Object.keys(storesMap())) stores[id] = true;
+  for (const id of store.getDeadStores()) if (!(id in stores)) stores[id] = null;
+  const data = { lists, stores, updatedAt: Date.now() };
+  if (withFav) data.favStore = store.getFavStore() || null;
+  return data;
+}
+
+/** Envoie l'état complet de l'appareil (fusionné côté serveur, sans effacer les ajouts des autres appareils). */
+function pushSpace(opts) {
+  enqueue({ op: 'set', path: ['spaces', spaceId()], data: spaceData(opts), merge: true, combine: true });
+}
+
+function setFavorite(id) {
+  store.setFavStore(id || null);
+  pushSpace({ withFav: true });
+}
+
+function watchSpace() {
+  if (!sync.isReady() || !store.getSpaceId()) return;
+  unwatchSpace?.();
+  const sid = spaceId();
+  unwatchSpace = sync.watchDoc(['spaces', sid], (data) => {
+    if (sid === store.getSpaceId()) onRemoteSpace(sid, data);
+  });
+}
+
+function onRemoteSpace(sid, data) {
+  if (store.hasPending(['spaces', sid])) return; // nos modifications partent d'abord
+  if (!data) return pushSpace({ withFav: true });
+
+  let needPush = false;
+  let changed = false;
+  const remoteLists = data.lists && typeof data.lists === 'object' ? data.lists : {};
+  const deadLists = new Set(store.getDeadLists());
+  let currentRemoved = false;
+
+  for (const [id, name] of Object.entries(remoteLists)) {
+    const local = getList(id);
+    if (name === null) {
+      if (local) {
+        store.removeList(id);
+        if (id === state.listId) currentRemoved = true;
+        changed = true;
+      }
+      store.addDeadList(id);
+    } else if (typeof name === 'string' && !local) {
+      if (deadLists.has(id)) needPush = true; // supprimée ici : notre suppression l'emporte
+      else {
+        store.upsertList({ id, name, createdAt: Date.now() });
+        changed = true;
+      }
+    }
+  }
+  for (const l of store.getLists()) if (!(l.id in remoteLists) && !isAutoEmpty(l)) needPush = true;
+
+  const remoteStores = data.stores && typeof data.stores === 'object' ? data.stores : {};
+  const deadStores = new Set(store.getDeadStores());
+  const all = storesMap();
+  for (const [id, alive] of Object.entries(remoteStores)) {
+    if (alive === null) {
+      if (all[id]) {
+        delete all[id];
+        if (store.getFavStore() === id) store.setFavStore(null);
+        if (state.storeId === id) state.storeId = null;
+        changed = true;
+      }
+      store.addDeadStore(id);
+    } else if (!all[id]) {
+      if (deadStores.has(id)) needPush = true;
+      else {
+        all[id] = { id, loading: true };
+        changed = true;
+      }
+    }
+  }
+  store.saveStores(all);
+  for (const id of Object.keys(all)) if (!(id in remoteStores)) needPush = true;
+
+  if ('favStore' in data) {
+    const fav = typeof data.favStore === 'string' && all[data.favStore] ? data.favStore : null;
+    if (fav !== store.getFavStore()) {
+      store.setFavStore(fav);
+      if (!state.storeId && fav && !sessionGet(`listme:store:${state.listId}`)) state.storeId = fav;
+      changed = true;
+    }
+  } else if (store.getFavStore()) {
+    pushSpace({ withFav: true });
+  }
+
+  if (needPush) pushSpace();
+  if (currentRemoved || !state.listId) {
+    // Liste courante retirée ailleurs, ou appareil sur l'écran d'accueil qui récupère ses listes.
+    const next = store.getLists()[0];
+    if (next) openList(next.id, { propose: !currentRemoved });
+    else if (currentRemoved) showWelcome({ message: 'Cette liste a été retirée de vos appareils.' });
+  } else if (changed) {
+    render();
+  }
+  syncStoreWatchers();
+}
+
+function joinSpace(id) {
+  if (!SPACE_RE.test(id) || id === store.getSpaceId()) return false;
+  store.setSpaceId(id);
+  pushSpace(); // ajoute ce que l'appareil possède déjà, sans toucher au favori de l'espace
+  watchSpace();
+  return true;
+}
+
+function spaceUrl() {
+  return `${baseUrl()}?space=${spaceId()}`;
+}
+
+function openDevices() {
+  const url = spaceUrl();
+  openSheet({
+    title: 'Mes appareils',
+    body: `<p class="sheet-text">Ouvrez ce lien sur votre autre téléphone ou ordinateur : vos listes, vos magasins, leurs prix et votre magasin favori y seront synchronisés.</p>
+      <div class="copy-field"><input class="text" readonly value="${esc(url)}" aria-label="Lien de synchronisation">
+        <button class="icon-btn" data-copy="${esc(url)}" aria-label="Copier le lien">${ICON.copy}</button></div>
+      <div class="stack">
+        ${navigator.share ? `<button class="btn btn-primary" data-native>${ICON.share} Envoyer le lien</button>` : `<button class="btn btn-primary" data-copy="${esc(url)}">${ICON.copy} Copier le lien</button>`}
+      </div>
+      <p class="sheet-note">Ce lien donne accès à toutes vos listes et vos magasins : gardez-le pour vous et votre foyer. Pour partager une seule liste, utilisez le bouton de partage de la liste.</p>
+      <details class="more">
+        <summary>${ICON.link} J’ai un lien venant d’un autre appareil</summary>
+        <form class="stack" data-join novalidate>
+          <input class="text" name="link" placeholder="https://…/?space=…" autocomplete="off" aria-label="Lien de synchronisation de l’autre appareil">
+          <small class="field-error" data-error hidden></small>
+          <button class="btn btn-secondary" type="submit">Synchroniser cet appareil</button>
+        </form>
+      </details>`,
+    onMount: ({ el, close }) => {
+      el.addEventListener('click', async (e) => {
+        const copyBtn = e.target.closest('[data-copy]');
+        if (copyBtn) toast((await copyText(copyBtn.dataset.copy)) ? 'Lien copié' : 'Copie impossible, sélectionnez le lien');
+        if (e.target.closest('[data-native]')) {
+          try {
+            await navigator.share({ title: 'ListMe : mes appareils', url });
+          } catch { /* partage annulé */ }
+        }
+      });
+      el.querySelector('[data-join]').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const raw = e.target.elements.link.value.trim();
+        let id = raw;
+        try {
+          id = new URL(raw).searchParams.get('space') || '';
+        } catch { /* identifiant collé seul */ }
+        const err = el.querySelector('[data-error]');
+        if (!SPACE_RE.test(id)) {
+          err.textContent = 'Lien non reconnu. Copiez-le depuis « Mes appareils » sur l’autre appareil.';
+          err.hidden = false;
+          return;
+        }
+        if (id === store.getSpaceId()) {
+          err.textContent = 'Cet appareil est déjà synchronisé avec ce lien.';
+          err.hidden = false;
+          return;
+        }
+        joinSpace(id);
+        close();
+        toast('Appareil synchronisé. Vos listes et magasins arrivent.');
+      });
+      el.querySelectorAll('input[readonly]').forEach((i) => i.addEventListener('focus', () => i.select()));
+    },
+  });
+}
+
+/* =========================================================================
+   Accueil : rejoindre une liste avec son code, ou en créer une nouvelle.
+   Affiché quand l'appareil n'a aucune liste : plus de liste vide créée d'office.
+   ========================================================================= */
+
+const LIST_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
+const fmtCode = (id) => id.replace(/(.{4})(?=.)/g, '$1 ');
+
+/** Lien ou code saisi → { listId } ou { spaceId } ou { error }. */
+function parseJoinInput(raw) {
+  const t = (raw || '').trim();
+  if (!t) return {};
+  try {
+    const url = new URL(t);
+    const list = url.searchParams.get('list');
+    const space = url.searchParams.get('space');
+    if (list && LIST_ID_RE.test(list)) return { listId: list };
+    if (space && SPACE_RE.test(space)) return { spaceId: space };
+    return { error: 'Ce lien ne contient pas de code de liste. Copiez-le depuis le bouton de partage de la liste.' };
+  } catch {
+    const code = t.replace(/[\s.]/g, '');
+    if (LIST_ID_RE.test(code)) return { listId: code };
+    return { error: 'Code non reconnu. Il se trouve dans le bouton de partage de la liste (20 caractères).' };
+  }
+}
+
+/** true / false si le serveur répond, null si impossible de vérifier (hors ligne). */
+async function checkListExists(id) {
+  if (!navigator.onLine) return null;
+  await sync.initSync();
+  if (!sync.isReady()) return null;
+  return new Promise((resolve) => {
+    let done = false;
+    let unsub = () => {};
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      setTimeout(() => unsub(), 0);
+      resolve(v);
+    };
+    unsub = sync.watchDoc(['lists', id], (d) => finish(!!d));
+    setTimeout(() => finish(null), 6000);
+  });
+}
+
+function joinList(id) {
+  if (!getList(id)) store.upsertList({ id, name: 'Liste partagée', createdAt: Date.now() });
+  store.removeDeadList(id);
+  pushSpace();
+  openList(id);
+}
+
+let welcomeTimer = null;
+
+function showWelcome({ message = '' } = {}) {
+  if (state.unwatch) state.unwatch();
+  state.unwatch = null;
+  state.listId = null;
+  state.items = {};
+  store.setCurrentId(null);
+  history.replaceState(null, '', location.pathname);
+  render();
+
+  const el = $('#welcome');
+  el.innerHTML = `<div class="welcome-card">
+      <div class="welcome-mark" aria-hidden="true">${ICON.check}</div>
+      <h1 id="welcome-title">ListMe</h1>
+      <p class="welcome-lead">${esc(message || 'Rejoignez une liste existante avec son code, ou commencez une nouvelle liste.')}</p>
+      <form class="stack" data-welcome novalidate>
+        <label class="field"><span>Code ou lien de la liste</span>
+          <input class="text" name="code" placeholder="Ex. AbCd EfGh IjKl MnOp QrSt" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+        <small class="field-help">Le code s’obtient avec le bouton de partage de la liste. Laissez vide pour créer une nouvelle liste.</small>
+        <small class="field-error" data-error hidden></small>
+        <button class="btn btn-primary" type="submit" data-submit>Créer une nouvelle liste</button>
+      </form>
+      <details class="more welcome-more">
+        <summary>${ICON.link} J’utilise déjà ListMe sur un autre appareil</summary>
+        <p class="sheet-note">Sur l’autre appareil : « Mes listes », puis « Retrouver sur un autre appareil ». Collez ici le lien obtenu pour récupérer toutes vos listes et vos magasins.</p>
+        <form class="stack" data-space novalidate>
+          <input class="text" name="link" placeholder="https://…/?space=…" autocomplete="off" aria-label="Lien de vos autres appareils">
+          <small class="field-error" data-space-error hidden></small>
+          <button class="btn btn-secondary" type="submit">Récupérer mes listes</button>
+        </form>
+      </details>
+    </div>`;
+  el.hidden = false;
+  document.body.classList.add('has-welcome');
+
+  const form = el.querySelector('[data-welcome]');
+  const input = form.elements.code;
+  const submit = form.querySelector('[data-submit]');
+  const error = form.querySelector('[data-error]');
+  const showError = (msg) => {
+    error.textContent = msg;
+    error.hidden = !msg;
+  };
+  input.addEventListener('input', () => {
+    showError('');
+    submit.textContent = input.value.trim() ? 'Rejoindre la liste' : 'Créer une nouvelle liste';
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const res = parseJoinInput(input.value);
+    if (res.error) return showError(res.error);
+    if (res.spaceId) return startSpaceJoin(el, res.spaceId);
+    if (!res.listId) {
+      openList(createList('Ma liste').id);
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = 'Recherche de la liste…';
+    const exists = await checkListExists(res.listId);
+    submit.disabled = false;
+    submit.textContent = 'Rejoindre la liste';
+    if (exists === false) return showError('Aucune liste ne correspond à ce code. Vérifiez les majuscules et minuscules.');
+    joinList(res.listId);
+    if (exists === null) toast('Liste ajoutée. Son contenu s’affichera dès le retour du réseau.');
+  });
+
+  el.querySelector('[data-space]').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const res = parseJoinInput(e.target.elements.link.value);
+    const err = el.querySelector('[data-space-error]');
+    const id = res.spaceId;
+    if (!id) {
+      err.textContent = res.listId
+        ? 'C’est un lien de liste : collez-le dans le champ du haut.'
+        : 'Lien non reconnu. Copiez-le depuis « Retrouver sur un autre appareil ».';
+      err.hidden = false;
+      return;
+    }
+    startSpaceJoin(el, id);
+  });
+}
+
+function startSpaceJoin(el, id) {
+  const err = el.querySelector('[data-space-error]') || el.querySelector('[data-error]');
+  if (!navigator.onLine) {
+    err.textContent = 'Une connexion est nécessaire pour récupérer vos listes.';
+    err.hidden = false;
+    return;
+  }
+  if (id !== store.getSpaceId()) joinSpace(id);
+  else watchSpace();
+  el.querySelector('.welcome-card').classList.add('is-waiting');
+  el.querySelector('.welcome-lead').textContent = 'Récupération de vos listes et magasins…';
+  clearTimeout(welcomeTimer);
+  welcomeTimer = setTimeout(() => {
+    if (state.listId) return;
+    el.querySelector('.welcome-card').classList.remove('is-waiting');
+    el.querySelector('.welcome-lead').textContent = 'Aucune liste trouvée pour ce lien pour le moment. Vérifiez le lien ou créez une nouvelle liste.';
+  }, 12000);
+}
+
+function hideWelcome() {
+  clearTimeout(welcomeTimer);
+  const el = $('#welcome');
+  if (el && !el.hidden) {
+    el.hidden = true;
+    el.innerHTML = '';
+  }
+  document.body.classList.remove('has-welcome');
+}
+
+/* =========================================================================
    Articles
    ========================================================================= */
 
 function putItem(item, listId = state.listId) {
   const next = { ...item, updatedAt: Date.now() };
+  const list = getList(listId);
+  if (list?.auto) {
+    store.upsertList({ ...list, auto: false });
+    queueMicrotask(() => pushSpace());
+  }
   if (listId === state.listId) {
     state.items[next.id] = next;
     store.saveItems(listId, state.items);
@@ -616,7 +1074,7 @@ function addToList(product, qty = 1) {
       next.checkedAt = 0;
       next.qty = qty;
     } else {
-      next.qty = typeof existing.qty === 'number' && typeof qty === 'number' ? Math.round((existing.qty + qty) * 100) / 100 : qty;
+      next.qty = combineQty(existing.qty, qty);
     }
     return { item: putItem(next), merged: !existing.checked };
   }
@@ -720,7 +1178,7 @@ function readUrlParams() {
       entries.push({ name: k.trim(), qty: parseQty(v) });
     }
   }
-  return { listId: params.get('list'), name: params.get('name'), entries };
+  return { listId: params.get('list'), name: params.get('name'), space: params.get('space'), entries };
 }
 
 async function importEntries(entries) {
@@ -813,17 +1271,26 @@ function qtyControls(it) {
 
 function priceChip(it) {
   if (!currentStore()) return '';
-  const p = priceOf(it);
-  if (p == null) {
+  const c = lineCost(it, priceEntry(it));
+  if (!c) {
     return `<button class="price-chip is-empty" data-action="price" aria-label="Saisir le prix de ${esc(it.name)}">+ prix</button>`;
   }
-  return `<button class="price-chip" data-action="price" aria-label="Prix de ${esc(it.name)} : ${money(lineTotal(it, p))}, modifier">${money(lineTotal(it, p))}</button>`;
+  return `<button class="price-chip" data-action="price" aria-label="Prix de ${esc(it.name)} : ${money(c.cost)}${c.buy ? `, ${c.buy}` : ''}, modifier">${money(c.cost)}</button>`;
 }
 
 function donePrice(it) {
   if (!currentStore()) return '';
-  const p = priceOf(it);
-  return p == null ? '' : `<span class="done-price">${money(lineTotal(it, p))}</span>`;
+  const c = lineCost(it, priceEntry(it));
+  return c ? `<span class="done-price">${money(c.cost)}</span>` : '';
+}
+
+/** Ligne secondaire sous le nom : ce qu'il faut acheter pour un produit vendu en paquet. */
+function buyHint(it) {
+  if (!currentStore()) return '';
+  const e = priceEntry(it);
+  if (!e || e.m !== 'pack') return '';
+  const c = lineCost(it, e);
+  return c?.buy ? `<span class="item-sub">À acheter : ${esc(c.buy)}</span>` : '';
 }
 
 function itemRow(it, done) {
@@ -834,7 +1301,7 @@ function itemRow(it, done) {
   return `<li class="item${flash}" data-id="${esc(it.id)}" style="--aisle:${a.color}">
       <button class="item-main" data-action="toggle" aria-pressed="${done}">
         <span class="check">${ICON.check}</span>
-        <span class="item-name">${esc(it.name)}</span>
+        <span class="item-text"><span class="item-name">${esc(it.name)}</span>${done ? '' : buyHint(it)}</span>
         ${done && qtyBadge ? `<span class="done-qty">${qtyBadge}</span>` : ''}
         ${done ? donePrice(it) : ''}
       </button>
@@ -889,7 +1356,7 @@ function renderList() {
   html += `<div class="list-actions">
       <button class="text-btn danger" data-action="clear-all">${ICON.trash} Vider la liste</button>
     </div>
-    <p class="hint">Appui long sur un article pour changer sa quantité ou son rayon.</p>`;
+    <p class="hint">Appui long sur un article (clic droit sur ordinateur) pour le renommer, changer sa quantité ou son rayon.</p>`;
   listEl.innerHTML = html;
 }
 
@@ -1137,7 +1604,12 @@ function openShare() {
     : '';
   openSheet({
     title: 'Partager la liste',
-    body: `<p class="sheet-text">Toute personne qui ouvre ce lien voit la liste et la modifie en direct avec vous.</p>
+    body: `<p class="sheet-text">Toute personne qui ouvre ce lien, ou saisit le code de la liste à l’accueil de ListMe, la voit et la modifie en direct avec vous.</p>
+      <div class="list-code">
+        <span>Code de la liste</span>
+        <strong>${esc(fmtCode(list.id))}</strong>
+        <button class="icon-btn" data-copy="${esc(list.id)}" aria-label="Copier le code">${ICON.copy}</button>
+      </div>
       <div class="copy-field"><input class="text" readonly value="${esc(shareUrl)}" aria-label="Lien de partage">
         <button class="icon-btn" data-copy="${esc(shareUrl)}" aria-label="Copier le lien">${ICON.copy}</button></div>
       <div class="stack">
@@ -1153,7 +1625,8 @@ function openShare() {
       el.addEventListener('click', async (e) => {
         const copyBtn = e.target.closest('[data-copy]');
         if (copyBtn) {
-          toast((await copyText(copyBtn.dataset.copy)) ? 'Lien copié' : 'Copie impossible, sélectionnez le lien');
+          const what = copyBtn.dataset.copy.startsWith('http') ? 'Lien copié' : 'Code copié';
+          toast((await copyText(copyBtn.dataset.copy)) ? what : 'Copie impossible, sélectionnez le texte');
         }
         if (e.target.closest('[data-native]')) {
           try {
@@ -1178,14 +1651,17 @@ function openLists() {
             <small>${left ? `${left} à acheter` : 'Rien à acheter'}</small>
           </button>
           <button class="icon-btn" data-rename="${esc(l.id)}" aria-label="Renommer ${esc(l.name)}">${ICON.edit}</button>
-          <button class="icon-btn" data-forget="${esc(l.id)}" aria-label="Retirer ${esc(l.name)} de cet appareil">${ICON.trash}</button>
+          <button class="icon-btn" data-forget="${esc(l.id)}" aria-label="Retirer ${esc(l.name)} de mes listes">${ICON.trash}</button>
         </li>`;
     })
     .join('');
   openSheet({
     title: 'Mes listes',
     body: `<ul class="lists">${rows}</ul>
-      <div class="stack"><button class="btn btn-primary" data-new>${ICON.plus} Nouvelle liste</button></div>`,
+      <div class="stack">
+        <button class="btn btn-primary" data-new>${ICON.plus} Nouvelle liste</button>
+        <button class="btn btn-secondary" data-devices>${ICON.link} Retrouver sur un autre appareil</button>
+      </div>`,
     onMount: ({ el, close }) => {
       el.addEventListener('click', async (e) => {
         const b = e.target.closest('button');
@@ -1199,6 +1675,9 @@ function openLists() {
         } else if (b.dataset.forget) {
           close();
           forgetList(b.dataset.forget);
+        } else if ('devices' in b.dataset) {
+          close();
+          openDevices();
         } else if ('new' in b.dataset) {
           close();
           const name = await promptSheet('Nouvelle liste', '', 'Créer la liste');
@@ -1217,6 +1696,8 @@ async function renameList(id) {
   const clean = tidy(name);
   store.upsertList({ ...list, name: clean });
   enqueueMeta(id, { name: clean });
+  store.upsertList({ ...getList(id), auto: false });
+  pushSpace();
   renderHeader();
 }
 
@@ -1225,16 +1706,19 @@ async function forgetList(id) {
   if (!list) return;
   const ok = await confirmSheet(
     'Retirer cette liste ?',
-    `« ${list.name} » sera retirée de cet appareil. Elle reste accessible à toute personne qui possède son lien.`,
-    'Retirer de cet appareil'
+    `« ${list.name} » sera retirée de vos appareils. Elle reste accessible à toute personne qui possède son lien.`,
+    'Retirer la liste'
   );
   if (!ok) return;
   store.removeList(id);
+  store.addDeadList(id);
+  pushSpace();
   if (id === state.listId) {
-    const next = store.getLists()[0] || createList('Ma liste');
-    openList(next.id);
+    const next = store.getLists()[0];
+    if (next) openList(next.id);
+    else showWelcome();
   }
-  toast('Liste retirée de cet appareil');
+  toast('Liste retirée de vos appareils');
 }
 
 function openStores() {
@@ -1255,7 +1739,8 @@ function openStores() {
         </li>`;
     })
     .join('');
-  const empty = `<p class="sheet-text">Enregistrez vos magasins avec leur position GPS : vous pourrez y saisir les prix et estimer le coût de la liste avant d’y aller.</p>`;
+  const empty = `<p class="sheet-text">Enregistrez vos magasins avec leur position GPS : vous pourrez y saisir les prix et estimer le coût de la liste avant d’y aller.</p>
+    <p class="sheet-note">Vos magasins sont déjà enregistrés sur un autre appareil ? <button class="link-btn" type="button" data-devices>Synchroniser cet appareil</button></p>`;
   openSheet({
     title: 'Magasins',
     body: `${rows ? `<ul class="lists">${rows}
@@ -1272,13 +1757,16 @@ function openStores() {
           selectStore(b.dataset.select || null);
         } else if (b.dataset.fav) {
           const id = b.dataset.fav;
-          store.setFavStore(store.getFavStore() === id ? null : id);
+          setFavorite(store.getFavStore() === id ? null : id);
           close();
           openStores();
           renderHeader();
         } else if (b.dataset.editStore) {
           close();
           openStoreForm(b.dataset.editStore);
+        } else if ('devices' in b.dataset) {
+          close();
+          openDevices();
         } else if ('newStore' in b.dataset) {
           close();
           openStoreForm(null);
@@ -1348,8 +1836,9 @@ function openStoreForm(id) {
           ? saveStore({ ...s, name, lat: c ? c.lat : null, lng: c ? c.lng : null })
           : createStore({ name, lat: c ? c.lat : null, lng: c ? c.lng : null });
         const fav = store.getFavStore();
-        if (form.fav.checked) store.setFavStore(saved.id);
-        else if (fav === saved.id) store.setFavStore(null);
+        if (form.fav.checked) {
+          if (fav !== saved.id) setFavorite(saved.id);
+        } else if (fav === saved.id) setFavorite(null);
         close();
         if (!s) selectStore(saved.id);
         else render();
@@ -1363,49 +1852,116 @@ function openPrice(id) {
   const it = state.items[id];
   const s = currentStore();
   if (!it || !s) return;
-  const p = priceOf(it, s);
-  const multi = typeof it.qty === 'number' && it.qty !== 1;
+  const existing = priceEntry(it, s);
+  const need = parseMeasure(it.qty);
+  const base = existing?.u || need?.base || 'g';
+  // Valeurs par défaut : paquet de 1 kg (ou 1 l) quand la liste demande un poids ou un volume.
+  let mode = existing?.m || (need ? 'pack' : 'unit');
+  const packUnit = base === 'ml' ? (existing?.a && existing.a < 1000 ? 'cl' : 'l') : existing?.a && existing.a < 1000 ? 'g' : 'kg';
+  const packAmount = existing?.m === 'pack' ? (packUnit === 'kg' || packUnit === 'l' ? existing.a / 1000 : packUnit === 'cl' ? existing.a / 10 : existing.a) : 1;
+  const unitOptions = (selected) =>
+    ['g', 'kg', 'cl', 'l', 'ml'].map((u) => `<option value="${u}"${u === selected ? ' selected' : ''}>${u}</option>`).join('');
+  const needText = need ? formatMeasure(need.value, need.base) : typeof it.qty === 'number' ? `${fmtQty(it.qty)}` : esc(it.qty);
+
   openSheet({
     title: it.name,
-    body: `<p class="sheet-text">Prix unitaire chez <strong>${esc(s.name)}</strong>. Il sera réutilisé pour les prochaines listes.</p>
-      <form class="stack" data-form>
-        <div class="price-field">
-          <input class="text" name="price" inputmode="decimal" value="${p != null ? fmtPrice(p) : ''}" placeholder="0,00" autocomplete="off" aria-label="Prix unitaire en euros">
-          <span aria-hidden="true">€</span>
+    body: `<p class="sheet-text">Prix chez <strong>${esc(s.name)}</strong>, réutilisé pour les prochaines listes. Quantité demandée : <strong>${needText}</strong>.</p>
+      <form class="stack" data-form novalidate>
+        <div class="segmented" role="radiogroup" aria-label="Mode de vente">
+          <button type="button" role="radio" data-mode="unit">À l’unité</button>
+          <button type="button" role="radio" data-mode="pack">En paquet</button>
+          <button type="button" role="radio" data-mode="bulk">Au poids</button>
         </div>
-        ${multi ? `<p class="sheet-note" data-total></p>` : ''}
+        <div class="price-line">
+          <div class="price-field">
+            <input class="text" name="price" inputmode="decimal" value="${existing ? fmtPrice(existing.p) : ''}" placeholder="0,00" autocomplete="off" aria-label="Prix en euros">
+            <span aria-hidden="true">€</span>
+          </div>
+          <div class="price-ref" data-show="pack">
+            <span>le paquet de</span>
+            <input class="text small" name="amount" inputmode="decimal" value="${frNum(packAmount)}" autocomplete="off" aria-label="Contenance du paquet">
+            <select class="text small" name="unit" aria-label="Unité">${unitOptions(packUnit)}</select>
+          </div>
+          <div class="price-ref" data-show="bulk">
+            <span>le</span>
+            <select class="text small" name="bulkUnit" aria-label="Unité de prix">
+              <option value="kg"${base !== 'ml' ? ' selected' : ''}>kilo</option>
+              <option value="l"${base === 'ml' ? ' selected' : ''}>litre</option>
+            </select>
+          </div>
+        </div>
+        <p class="price-breakdown" data-breakdown aria-live="polite"></p>
         <small class="field-error" data-error hidden></small>
         <button class="btn btn-primary" type="submit">Enregistrer le prix</button>
-        ${p != null ? `<button class="btn btn-secondary is-danger" type="button" data-clear>Effacer le prix</button>` : ''}
+        ${existing ? `<button class="btn btn-secondary is-danger" type="button" data-clear>Effacer le prix</button>` : ''}
       </form>`,
     onMount: ({ el, close }) => {
       const form = el.querySelector('[data-form]');
-      const totalEl = el.querySelector('[data-total]');
+      const f = form.elements;
+      const out = el.querySelector('[data-breakdown]');
       const error = el.querySelector('[data-error]');
-      const updateTotal = () => {
-        if (!totalEl) return;
-        const v = parsePrice(form.price.value);
-        totalEl.textContent = Number.isFinite(v) && v != null ? `${fmtQty(it.qty)} × ${money(v)} = ${money(v * it.qty)}` : `Quantité : ${fmtQty(it.qty)}`;
+
+      const readEntry = () => {
+        const p = parsePrice(f.price.value);
+        if (p == null || Number.isNaN(p)) return { error: 'Saisissez un montant, par exemple 1,29.' };
+        if (mode === 'unit') return { p, m: 'unit' };
+        if (mode === 'bulk') return { p, m: 'bulk', a: 1000, u: f.bulkUnit.value === 'l' ? 'ml' : 'g' };
+        const amount = parsePrice(f.amount.value);
+        if (!amount) return { error: 'Indiquez la contenance du paquet, par exemple 1 kg ou 500 g.' };
+        const [u, factor] = UNIT_BASE[f.unit.value];
+        return { p, m: 'pack', a: amount * factor, u };
       };
-      updateTotal();
-      form.price.addEventListener('input', updateTotal);
+
+      const refresh = () => {
+        el.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
+        el.querySelectorAll('[data-show]').forEach((x) => (x.hidden = x.dataset.show !== mode));
+        const e = readEntry();
+        if (e.error) {
+          out.textContent = mode === 'pack' ? 'Prix du paquet et contenance : le nombre de paquets à acheter est calculé.' : '';
+          return;
+        }
+        const c = lineCost(it, e);
+        if (e.m === 'unit') {
+          out.textContent = typeof it.qty === 'number' && it.qty !== 1 ? `${fmtQty(it.qty)} × ${money(e.p)} = ${money(c.cost)}` : `${money(c.cost)}`;
+        } else if (e.m === 'pack') {
+          const needs = need && need.base === e.u ? `${formatMeasure(need.value, need.base)} demandés : ` : '';
+          out.textContent = `${needs}${c.buy} = ${money(c.cost)} (soit ${perRef(e)})`;
+        } else {
+          const amount = need && need.base === e.u ? formatMeasure(need.value, need.base) : c.buy;
+          out.textContent = `${amount} à ${perRef(e)} = ${money(c.cost)}`;
+        }
+      };
+
+      el.querySelectorAll('[data-mode]').forEach((b) =>
+        b.addEventListener('click', () => {
+          mode = b.dataset.mode;
+          refresh();
+        })
+      );
+      form.addEventListener('input', () => {
+        error.hidden = true;
+        refresh();
+      });
+      form.addEventListener('change', refresh);
+      refresh();
       setTimeout(() => {
-        form.price.focus();
-        form.price.select();
+        f.price.focus();
+        f.price.select();
       }, 30);
+
       el.querySelector('[data-clear]')?.addEventListener('click', () => {
         setPrice(it, null);
         close();
       });
-      form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const v = parsePrice(form.price.value);
-        if (Number.isNaN(v)) {
-          error.textContent = 'Saisissez un montant, par exemple 2,49.';
+      form.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        const e = readEntry();
+        if (e.error) {
+          error.textContent = e.error;
           error.hidden = false;
           return;
         }
-        setPrice(it, v);
+        setPrice(it, e);
         close();
       });
     },
@@ -1416,41 +1972,79 @@ function openEdit(id) {
   const it = state.items[id];
   if (!it) return;
   let aisle = it.aisle;
+  let aisleTouched = false;
+  const product = findProduct(it.name);
+  const isCustom = !!product?.custom;
   openSheet({
-    title: it.name,
-    body: `<form class="stack" data-form>
+    title: 'Modifier l’article',
+    body: `<form class="stack" data-form novalidate>
+        <label class="field"><span>Produit</span>
+          <input class="text" name="itemName" value="${esc(it.name)}" maxlength="60" autocomplete="off" autocapitalize="sentences" required></label>
+        ${isCustom ? `<label class="toggle" data-forget-row hidden><input type="checkbox" name="forget" checked>
+          <span>Retirer « ${esc(it.name)} » des suggestions</span></label>` : ''}
         <label class="field"><span>Quantité</span>
           <input class="text" name="qty" value="${esc(fmtQty(it.qty))}" maxlength="20" autocomplete="off" placeholder="1, 2, 500 g…"></label>
-        ${currentStore() ? `<label class="field"><span>Prix unitaire chez ${esc(currentStore().name)}</span>
-          <div class="price-field"><input class="text" name="price" inputmode="decimal" value="${priceOf(it) != null ? fmtPrice(priceOf(it)) : ''}" placeholder="0,00" autocomplete="off"><span aria-hidden="true">€</span></div></label>` : ''}
         <div class="field"><span>Rayon</span>${aisleChips(aisle, null)}</div>
         <button class="btn btn-primary" type="submit">Enregistrer</button>
         <button class="btn btn-secondary is-danger" type="button" data-delete>${ICON.trash} Supprimer l’article</button>
       </form>`,
     onMount: ({ el, close }) => {
+      const form = el.querySelector('[data-form]');
+      const f = form.elements;
       const chips = el.querySelectorAll('[data-aisle]');
+      const pressChip = (id2) => chips.forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.aisle === id2)));
       chips.forEach((b) =>
         b.addEventListener('click', () => {
           aisle = b.dataset.aisle;
-          chips.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+          aisleTouched = true;
+          pressChip(aisle);
         })
       );
+      // En renommant, le rayon suit le produit du catalogue (« Zeste de citron » → « Citron »).
+      f.itemName.addEventListener('input', () => {
+        const renamed = normalize(f.itemName.value) !== normalize(it.name);
+        el.querySelector('[data-forget-row]')?.toggleAttribute('hidden', !renamed);
+        const p = findProduct(f.itemName.value);
+        if (p && !aisleTouched) {
+          aisle = p.aisle;
+          pressChip(aisle);
+        }
+      });
       el.querySelector('[data-delete]').addEventListener('click', () => {
         close();
         deleteItems([id], `${it.name} supprimé`);
       });
-      el.querySelector('[data-form]').addEventListener('submit', (e) => {
+      form.addEventListener('submit', (e) => {
         e.preventDefault();
         const cur = state.items[id];
         if (!cur) return close();
-        putItem({ ...cur, qty: parseQty(e.target.qty.value), aisle });
-        if (e.target.price && currentStore()) {
-          const v = parsePrice(e.target.price.value);
-          if (!Number.isNaN(v) && v !== priceOf(cur)) setPrice(cur, v);
+        const qty = parseQty(f.qty.value);
+        const typed = tidy(f.itemName.value) || cur.name;
+        const renamed = normalize(typed) !== normalize(cur.name);
+
+        if (!renamed) {
+          putItem({ ...cur, qty, aisle });
+          if (aisle !== cur.aisle) registerProduct(product ? product.name : cur.name, aisle, product ? product.id : slug(cur.name));
+          render();
+          return close();
         }
-        if (aisle !== cur.aisle) {
-          const p = findProduct(cur.name);
-          registerProduct(p ? p.name : cur.name, aisle, p ? p.id : slug(cur.name));
+
+        const target = findProduct(typed);
+        const newName = target ? target.name : typed;
+        if (!target) registerProduct(newName, aisle);
+        else if (aisleTouched && aisle !== target.aisle) registerProduct(target.name, aisle, target.id);
+        if (isCustom && f.forget?.checked) removeCustomProduct(product.id);
+
+        const other = Object.values(state.items).find((i) => i.id !== cur.id && normalize(i.name) === normalize(newName));
+        if (other) {
+          putItem({ ...other, qty: other.checked ? qty : combineQty(other.qty, qty), checked: false, checkedAt: 0, aisle });
+          delete state.items[cur.id];
+          store.saveItems(state.listId, state.items);
+          enqueue({ op: 'delete', path: itemPath(state.listId, cur.id) });
+          toast(`Regroupé avec ${other.name}`);
+        } else {
+          putItem({ ...cur, name: newName, nameNorm: normalize(newName), qty, aisle });
+          toast(`Renommé en ${newName}`);
         }
         render();
         close();
@@ -1515,7 +2109,9 @@ function bindEvents() {
   let pressTimer = null;
   let pressStart = null;
   let suppressClick = false;
+  let lastPointerType = 'mouse';
   listEl.addEventListener('pointerdown', (e) => {
+    lastPointerType = e.pointerType;
     const row = e.target.closest('.item');
     suppressClick = false;
     if (!row || e.target.closest('.qty, .price-chip')) return;
@@ -1533,7 +2129,11 @@ function bindEvents() {
     if (pressStart && Math.hypot(e.clientX - pressStart.x, e.clientY - pressStart.y) > 10) cancelPress();
   });
   listEl.addEventListener('contextmenu', (e) => {
-    if (e.target.closest('.item')) e.preventDefault();
+    const row = e.target.closest('.item');
+    if (!row) return;
+    e.preventDefault();
+    // Clic droit sur ordinateur (l'appui long sur mobile est géré plus haut).
+    if (lastPointerType === 'mouse' && !e.target.closest('.qty, .price-chip')) openEdit(row.dataset.id);
   });
 
   listEl.addEventListener('click', async (e) => {
@@ -1601,25 +2201,38 @@ async function boot() {
   registerServiceWorker();
   sync.onStatus(renderStatus);
 
-  const { listId, name, entries } = readUrlParams();
+  const { listId, name, space, entries } = readUrlParams();
   let id = null;
+  const joined = space ? joinSpace(space) : false;
+  if (store.getLists().length || Object.keys(storesMap()).length) spaceId();
 
   if (listId && /^[A-Za-z0-9_-]{8,64}$/.test(listId)) {
     // Liste partagée : on l'ajoute localement sans écraser son nom côté serveur.
-    if (!getList(listId)) store.upsertList({ id: listId, name: name ? tidy(name) : 'Liste partagée', createdAt: Date.now() });
+    if (!getList(listId)) {
+      store.upsertList({ id: listId, name: name ? tidy(name) : 'Liste partagée', createdAt: Date.now() });
+      store.removeDeadList(listId);
+      pushSpace();
+    }
     id = listId;
   } else if (name && entries.length) {
     id = createList(name).id;
   } else {
     id = store.getCurrentId();
-    if (!getList(id)) id = store.getLists()[0]?.id || createList('Ma liste').id;
+    if (!getList(id)) id = store.getLists()[0]?.id || null;
+    // Un lien d'ajout sans liste sur un appareil neuf : la liste aura du contenu, on la crée.
+    if (!id && entries.length) id = createList('Ma liste').id;
   }
-  openList(id, { propose: false });
+  if (id) openList(id, { propose: false });
+  else showWelcome();
+  if (!id && joined) startSpaceJoin($('#welcome'), store.getSpaceId());
 
   if (entries.length) await importEntries(entries);
 
+  if (joined) toast('Appareil synchronisé. Vos listes et magasins arrivent.');
+
   sync.onReady(() => {
     attachWatchers();
+    watchSpace();
     syncStoreWatchers();
     sync.watchProducts(mergeRemoteProducts);
   });

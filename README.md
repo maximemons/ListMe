@@ -2,6 +2,15 @@
 
 Une liste de courses partagée en direct, pensée pour le téléphone et utilisable sans réseau dans le magasin. Pas de compte : une liste se partage par son lien.
 
+## Accueil
+
+À la première visite (ou quand plus aucune liste n’est enregistrée sur l’appareil), un écran d’accueil propose :
+
+- un champ « Code ou lien de la liste » : rempli, il rejoint une liste existante (le code est vérifié auprès du serveur) ; laissé vide, il crée une nouvelle liste ;
+- « J’utilise déjà ListMe sur un autre appareil » : coller le lien « Mes appareils » récupère toutes vos listes et vos magasins.
+
+Aucune liste vide n’est donc créée d’office. Le code d’une liste (20 caractères, majuscules et minuscules comptent) est affiché dans la fenêtre de partage.
+
 ## Ajouter des produits
 
 - La barre de recherche propose les produits d’un catalogue d’environ 860 références, classées par rayon. La recherche ignore les accents, les majuscules et le pluriel.
@@ -36,7 +45,10 @@ La fenêtre de partage génère aussi un « lien d’ajout » contenant les arti
 
 - Toucher un article le coche : il descend dans « Dans le caddie », barré. Le toucher à nouveau le remet dans la liste.
 - Les boutons − / + changent la quantité ; à 1, − devient une corbeille.
-- Appui long sur un article : modifier la quantité, le prix, le rayon (le catalogue est mis à jour) ou le supprimer.
+- Appui long sur un article (clic droit sur ordinateur) : le renommer, modifier sa quantité, son rayon ou le supprimer.
+  - Renommer « Zeste de citron » en « Citron » rattache l’article au produit du catalogue (et à son rayon). Si « Citron » est déjà dans la liste, les deux lignes sont regroupées.
+  - Pour un produit ajouté par un utilisateur, la case « Retirer des suggestions » l’enlève aussi du catalogue.
+- Ajouter un produit déjà présent additionne les quantités, y compris les poids et volumes (60 g + 200 g = 260 g).
 - « Retirer les cochés » et « Vider la liste » (avec confirmation) ; les deux proposent d’annuler.
 - La barre de progression indique combien d’articles sont déjà au caddie.
 
@@ -44,16 +56,27 @@ La fenêtre de partage génère aussi un « lien d’ajout » contenant les arti
 
 - Le bouton magasin, sous le nom de la liste, ouvre la liste de vos magasins. Chaque magasin a un nom et une position GPS (bouton cible pour prendre la position actuelle, ou coordonnées collées depuis une carte, ex. `50.6366, 3.0699`).
 - L’étoile désigne le magasin favori, sélectionné par défaut à l’ouverture d’une liste.
-- Avec un magasin sélectionné, chaque article affiche son prix (ou « + prix » pour le saisir). Le prix saisi est un prix unitaire, multiplié par la quantité.
+- Avec un magasin sélectionné, chaque article affiche son coût (ou « + prix » pour le saisir). Trois façons de saisir un prix :
+  - **À l’unité** : prix d’un article, multiplié par la quantité ;
+  - **En paquet** : prix et contenance du paquet (ex. 1,29 € le paquet de 1 kg). La liste demande 60 g de farine ? Il faut acheter 1 paquet de 1 kg : le coût compté est 1,29 € et la ligne affiche « À acheter : 1 × 1 kg ». Le prix au kilo (ou au litre) est indiqué ;
+  - **Au poids** : prix au kilo ou au litre pour le vrac (ex. tomates à 2,99 €/kg, 1,5 kg demandés = 4,49 €).
+  Pour un produit demandé au poids ou au volume, la saisie propose par défaut un paquet de 1 kg (ou 1 l).
 - L’estimation du total s’affiche en haut à droite. Un `+` signale que certains articles n’ont pas encore de prix ; la toucher donne le détail (total, montant déjà au caddie, articles sans prix).
 - Les prix sont enregistrés par magasin et réutilisés d’une liste à l’autre.
 - À l’ouverture d’une liste, si l’appareil autorise la localisation et que le magasin le plus proche n’est pas celui sélectionné, une fenêtre propose de le choisir (une fois par liste et par session). La position de l’appareil n’est jamais envoyée au serveur ; seule celle des magasins est enregistrée.
-- Les magasins (et leurs prix) sont rattachés aux listes que vous ouvrez : les personnes avec qui une liste est partagée voient les mêmes magasins et les mêmes prix. Le favori reste propre à chaque appareil.
+- Les magasins (et leurs prix) sont aussi rattachés aux listes que vous ouvrez : les personnes avec qui une liste est partagée voient les mêmes magasins et les mêmes prix.
+
+## Mes appareils
+
+- « Mes listes » > « Retrouver sur un autre appareil » donne un lien personnel. L’ouvrir sur un autre téléphone ou ordinateur y synchronise toutes vos listes, vos magasins, leurs prix et votre magasin favori, dans les deux sens.
+- On peut aussi coller ce lien dans la même fenêtre sur l’autre appareil.
+- Retirer une liste ou supprimer un magasin s’applique à tous vos appareils.
+- Ce lien donne accès à toutes vos listes : ne le transmettez qu’à vous-même ou à votre foyer.
 
 ## Listes et partage
 
-- Le nom de la liste, en haut, ouvre « Mes listes » : changer de liste, en créer, renommer, retirer de l’appareil.
-- Les listes restent sur l’appareil (localStorage).
+- Le nom de la liste, en haut, ouvre « Mes listes » : changer de liste, en créer, renommer, retirer.
+- Les listes sont gardées sur l’appareil (localStorage) et synchronisées avec vos autres appareils (voir « Mes appareils »).
 - Le bouton de partage fournit le lien de la liste. Toute personne qui l’ouvre voit et modifie la même liste, en direct.
 
 ## Hors ligne
@@ -99,10 +122,13 @@ products/{idProduit}            name, nameNorm, aisle, updatedAt
 lists/{idListe}                 name, storeIds, createdAt, updatedAt
 lists/{idListe}/items/{idItem}  name, nameNorm, aisle, qty, checked, checkedAt, createdAt, updatedAt
 stores/{idMagasin}              name, lat, lng, prices{idProduit: prix}, createdAt, updatedAt
+spaces/{idEspace}               lists{idListe: nom|null}, stores{idMagasin: true|null}, favStore, updatedAt
 ```
+
+Un prix vaut soit un nombre (prix à l’unité), soit `{ p, m, a, u }` : `m` = `unit`, `pack` (paquet de `a` g ou ml) ou `bulk` (prix pour `a` g ou ml, 1000 pour un prix au kg ou au litre), `u` = `g` ou `ml`.
 
 ## Sécurité
 
-Sans authentification, la protection repose sur des identifiants aléatoires de 20 caractères : qui possède le lien d’une liste peut la lire et la modifier. Les règles empêchent de lister les listes ou les magasins et limitent les champs acceptés. La clé `apiKey` présente dans `firebase-config.js` est prévue pour être publique ; ce sont les règles Firestore qui protègent les données.
+Sans authentification, la protection repose sur des identifiants aléatoires de 20 à 24 caractères : qui possède le lien d’une liste peut la lire et la modifier. Les règles empêchent de lister les listes, les magasins ou les espaces et limitent les champs acceptés. La clé `apiKey` présente dans `firebase-config.js` est prévue pour être publique ; ce sont les règles Firestore qui protègent les données.
 
 Ne mettez aucune donnée personnelle ou confidentielle dans les noms de listes, de produits ou de magasins.

@@ -11,6 +11,8 @@ const K = {
   stores: 'listme:stores',
   favStore: 'listme:favStore',
   deadStores: 'listme:deadStores',
+  space: 'listme:space',
+  deadLists: 'listme:deadLists',
 };
 
 function read(key, fallback) {
@@ -94,6 +96,24 @@ export const store = {
     if (!dead.includes(id)) write(K.deadStores, [...dead, id].slice(-200));
   },
 
+  /* ---- Espace personnel (synchronisation entre appareils) ---- */
+  getSpaceId() {
+    return read(K.space, null);
+  },
+  setSpaceId(id) {
+    write(K.space, id);
+  },
+  getDeadLists() {
+    return read(K.deadLists, []);
+  },
+  addDeadList(id) {
+    const dead = this.getDeadLists();
+    if (!dead.includes(id)) write(K.deadLists, [...dead, id].slice(-200));
+  },
+  removeDeadList(id) {
+    write(K.deadLists, this.getDeadLists().filter((x) => x !== id));
+  },
+
   /* ---- File d'attente de synchronisation ----
      Une seule opération est conservée par document : la plus récente.
      Les opérations sont idempotentes (set complet ou delete), on peut donc
@@ -134,9 +154,9 @@ export const store = {
     }
     return map;
   },
-  pendingProductIds() {
-    return new Set(
-      this.getQueue().filter((o) => o.path[0] === 'products').map((o) => o.path[1])
-    );
+  pendingProductOps() {
+    const map = new Map();
+    for (const o of this.getQueue()) if (o.path[0] === 'products') map.set(o.path[1], o);
+    return map;
   },
 };

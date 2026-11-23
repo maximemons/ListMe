@@ -1,6 +1,6 @@
 // Service worker ListMe : rend l'application disponible hors ligne.
 // Incrémenter VERSION à chaque mise en ligne pour rafraîchir le cache.
-const VERSION = 'listme-v1.0.0';
+const VERSION = 'listme-v1.2.0';
 
 const SHELL = [
   './',
